@@ -119,7 +119,7 @@ func CompareAttributeValuesByOperator(val1 AttributeValue, val2 AttributeValue, 
 		}
 
 		comp := n1.Cmp(n2)
-		
+
 		switch op {
 		case "=":
 			return comp == 0, nil
@@ -135,29 +135,32 @@ func CompareAttributeValuesByOperator(val1 AttributeValue, val2 AttributeValue, 
 			return false, fmt.Errorf("unsupported comparison operator for number: %s", op)
 		}
 	} else {
-		comp := strings.Compare(val1Str, val2Str)
-		
-		switch op {
-		case "=":
-			return comp == 0, nil
-		case "<":
-			return comp < 0, nil
-		case ">":
-			return comp > 0, nil
-		case "<=":
-			return comp <= 0, nil
-		case ">=":
-			return comp >= 0, nil
-		default:
-			return false, fmt.Errorf("unsupported comparison operator for string: %s", op)
-		}
+		return CompareStringValues(val1Str, val2Str, op)
+	}
+}
+
+func CompareStringValues(val1 string, val2 string, op string) (bool, error) {
+	comp := strings.Compare(val1, val2)
+	switch op {
+	case "=":
+		return comp == 0, nil
+	case "<":
+		return comp < 0, nil
+	case ">":
+		return comp > 0, nil
+	case "<=":
+		return comp <= 0, nil
+	case ">=":
+		return comp >= 0, nil
+	default:
+		return false, fmt.Errorf("unsupported comparison operator for string: %s", op)
 	}
 }
 
 func UnionSets(currentAV AttributeValue, addAV AttributeValue) AttributeValue {
 	if addSet, ok := addAV["SS"].([]interface{}); ok {
 		currentSet, _ := GetStringSet(currentAV)
-		
+
 		setMap := make(map[string]struct{})
 		for _, s := range currentSet {
 			setMap[s] = struct{}{}
@@ -174,7 +177,7 @@ func UnionSets(currentAV AttributeValue, addAV AttributeValue) AttributeValue {
 		}
 		return AttributeValue{"SS": newSet}
 	}
-	
+
 	if addSet, ok := addAV["NS"].([]interface{}); ok {
 		currentSet, _ := GetNumberSet(currentAV)
 
@@ -214,14 +217,14 @@ func UnionSets(currentAV AttributeValue, addAV AttributeValue) AttributeValue {
 		}
 		return AttributeValue{"BS": newSet}
 	}
-	
+
 	return currentAV
 }
 
 func SubtractSets(currentAV AttributeValue, deleteAV AttributeValue) (AttributeValue, error) {
 	if deleteSet, ok := deleteAV["SS"].([]interface{}); ok {
 		currentSet, _ := GetStringSet(currentAV)
-		
+
 		deleteMap := make(map[string]struct{})
 		for _, item := range deleteSet {
 			if str, isStr := item.(string); isStr {
@@ -237,7 +240,7 @@ func SubtractSets(currentAV AttributeValue, deleteAV AttributeValue) (AttributeV
 				newSet = append(newSet, s)
 			}
 		}
-		
+
 		if len(newSet) == 0 {
 			return nil, nil 
 		}
@@ -246,7 +249,7 @@ func SubtractSets(currentAV AttributeValue, deleteAV AttributeValue) (AttributeV
 
 	if deleteSet, ok := deleteAV["NS"].([]interface{}); ok {
 		currentSet, _ := GetNumberSet(currentAV)
-		
+
 		deleteMap := make(map[string]struct{})
 		for _, item := range deleteSet {
 			if str, isStr := item.(string); isStr {
@@ -262,7 +265,7 @@ func SubtractSets(currentAV AttributeValue, deleteAV AttributeValue) (AttributeV
 				newSet = append(newSet, n)
 			}
 		}
-		
+
 		if len(newSet) == 0 {
 			return nil, nil 
 		}
@@ -271,7 +274,7 @@ func SubtractSets(currentAV AttributeValue, deleteAV AttributeValue) (AttributeV
 
 	if deleteSet, ok := deleteAV["BS"].([]interface{}); ok {
 		currentSet, _ := GetBinarySet(currentAV)
-		
+
 		deleteMap := make(map[string]struct{})
 		for _, item := range deleteSet {
 			if str, isStr := item.(string); isStr {
@@ -287,7 +290,7 @@ func SubtractSets(currentAV AttributeValue, deleteAV AttributeValue) (AttributeV
 				newSet = append(newSet, b)
 			}
 		}
-		
+
 		if len(newSet) == 0 {
 			return nil, nil 
 		}
