@@ -99,7 +99,7 @@ type DeleteItemInput struct {
 	ReturnValues string `json:"ReturnValues,omitempty"`
     ConditionExpression string `json:"ConditionExpression,omitempty"`
     ExpressionAttributeNames map[string]string `json:"ExpressionAttributeNames,omitempty"`
-    ExpressionAttributeValues map[string]model.AttributeValue `json:"ExpressionAttributeValues,omitempty"`
+    ExpressionAttributeValues map[string]AttributeValue `json:"ExpressionAttributeValues,omitempty"`
 }
 
 func (s *Server) handleDeleteItem(w http.ResponseWriter, body []byte) {
@@ -307,8 +307,6 @@ func (s *Server) handleUpdateItem(w http.ResponseWriter, body []byte) {
 	w.Write(responseBody)
 }
 
-// --- BatchWriteItem handler ---
-
 type WriteRequest struct {
 	PutRequest *struct {
 		Item model.Record `json:"Item"`
@@ -398,6 +396,181 @@ func (s *Server) handleBatchWriteItem(w http.ResponseWriter, body []byte) {
 	
 	if err := s.Database.DB.Write(totalBatch, nil); err != nil {
 		s.writeDynamoDBError(w, "InternalServerError", "Internal DB error during batch write.", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{}`))
+}
+
+// --- TransactWriteItems handler ---
+
+type TransactWriteItem struct {
+	Put *model.PutItemInput `json:"Put,omitempty"`
+	Update *model.UpdateItemInput `json:"Update,omitempty"`
+	Delete *DeleteItemInput `json:"Delete,omitempty"`
+	ConditionCheck *struct {
+		TableName string `json:"TableName"`
+		Key map[string]model.AttributeValue `json:"Key"`
+		ConditionExpression string `json:"ConditionExpression"`
+		ExpressionAttributeNames map[string]string `json:"ExpressionAttributeNames,omitempty"`
+		ExpressionAttributeValues map[string]model.AttributeValue `json:"ExpressionAttributeValues,omitempty"`
+	} `json:"ConditionCheck,omitempty"`
+}
+
+type TransactWriteItemsInput struct {
+	TransactItems []TransactWriteItem `json:"TransactItems"`
+}
+
+func (s *Server) handleTransactWriteItems(w http.ResponseWriter, body []byte) {
+	var input TransactWriteItemsInput
+	if err := json.Unmarshal(body, &input); err != nil {
+		s.writeDynamoDBError(w, "ValidationException", "Invalid JSON input", http.StatusBadRequest)
+		return
+	}
+
+	totalBatch := new(leveldb.Batch)
+
+	s.Database.Lock()
+	defer s.Database.Unlock()
+
+	for i, item := range input.TransactItems {
+		var tableName string
+		var key map[string]model.AttributeValue
+		var currentInput interface{}
+
+		if item.Put != nil {
+			tableName = item.Put.TableName
+			key = core.GetItemKey(item.Put.Item, s.Database.Tables[tableName])
+			currentInput = item.Put
+		} else if item.Update != nil {
+			tableName = item.Update.TableName
+			key = item.Update.Key
+			currentInput = item.Update
+		} else if item.Delete != nil {
+			tableName = item.Delete.TableName
+			key = item.Delete.Key
+			currentInput = item.Delete
+		} else if item.ConditionCheck != nil {
+			tableName = item.ConditionCheck.TableName
+			key = item.ConditionCheck.Key
+			currentInput = item.ConditionCheck
+		} else {
+			continue 
+		}
+
+		schema, ok := s.Database.Tables[tableName]
+		if !ok {
+			s.writeDynamoDBError(w, "ResourceNotFoundException", fmt.Sprintf("Table %s not found in item %d", tableName, i), http.StatusBadRequest)
+			return
+		}
+
+		pkAV, ok := key[schema.PartitionKey]
+		if !ok {
+			s.writeDynamoDBError(w, "ValidationException", fmt.Sprintf("Partition Key missing for item %d in table %s", i, tableName), http.StatusBadRequest)
+			return
+		}
+		pkVal, _ := model.GetAttributeValueString(pkAV)
+
+		var skVal string
+		if schema.SortKey != "" {
+			if skAV, ok := key[schema.SortKey]; ok {
+				skVal, _ = model.GetAttributeValueString(skAV)
+			}
+		}
+		levelDBKey := model.BuildLevelDBKey(tableName, pkVal, skVal)
+
+		oldValue, err := s.Database.DB.Get([]byte(levelDBKey), nil)
+		var oldRecord model.Record
+		recordExists := err == nil
+		if err != nil && err != leveldb.ErrNotFound {
+			s.writeDynamoDBError(w, "InternalServerError", "Internal DB error during read for transaction.", http.StatusInternalServerError)
+			return
+		}
+		if err == nil {
+			oldRecord, _ = model.UnmarshalRecord(oldValue)
+		}
+
+		var newRecord model.Record
+		var condition model.ConditionInput
+		var isWriteOp bool = false
+
+		switch req := currentInput.(type) {
+		case *model.PutItemInput:
+			isWriteOp = true
+			newRecord = req.Item
+			condition = model.ConditionInput{
+				ConditionExpression:       req.ConditionExpression,
+				ExpressionAttributeNames:  req.ExpressionAttributeNames,
+				ExpressionAttributeValues: req.ExpressionAttributeValues,
+			}
+		case *model.UpdateItemInput:
+			isWriteOp = true
+			condition = model.ConditionInput{
+				ConditionExpression:       req.ConditionExpression,
+				ExpressionAttributeNames:  req.ExpressionAttributeNames,
+				ExpressionAttributeValues: req.ExpressionAttributeValues,
+			}
+			actions, err := core.ParseUpdateExpression(req)
+			if err != nil {
+				s.writeDynamoDBError(w, "ValidationException", fmt.Sprintf("Invalid UpdateExpression for item %d: %v", i, err), http.StatusBadRequest)
+				return
+			}
+			newRecord, err = core.ApplyUpdateActions(oldRecord, actions)
+			if err != nil {
+				s.writeDynamoDBError(w, "ValidationException", fmt.Sprintf("Failed to apply update for item %d: %v", i, err), http.StatusBadRequest)
+				return
+			}
+
+		case *DeleteItemInput:
+			isWriteOp = true
+			newRecord = nil 
+			condition = model.ConditionInput{
+				ConditionExpression:       req.ConditionExpression,
+				ExpressionAttributeNames:  req.ExpressionAttributeNames,
+				ExpressionAttributeValues: req.ExpressionAttributeValues,
+			}
+
+		case *struct { TableName string; Key map[string]model.AttributeValue; ConditionExpression string; ExpressionAttributeNames map[string]string; ExpressionAttributeValues map[string]model.AttributeValue }:
+			condition = model.ConditionInput{
+				ConditionExpression:       req.ConditionExpression,
+				ExpressionAttributeNames:  req.ExpressionAttributeNames,
+				ExpressionAttributeValues: req.ExpressionAttributeValues,
+			}
+			
+		default:
+			continue
+		}
+
+		if condition.ConditionExpression != "" {
+			recordForEvaluation := oldRecord
+			if !recordExists && item.ConditionCheck == nil { recordForEvaluation = nil }
+
+			ok, condErr := core.EvaluateConditionExpression(recordForEvaluation, condition)
+			if condErr != nil {
+				s.writeDynamoDBError(w, "ValidationException", fmt.Sprintf("Condition evaluation error for item %d: %v", i, condErr), http.StatusBadRequest)
+				return
+			}
+			if !ok {
+				s.writeDynamoDBError(w, "TransactionCanceledException", fmt.Sprintf("Transaction canceled, condition check failed for item %d.", i), http.StatusConflict)
+				return
+			}
+		}
+
+		if isWriteOp {
+			core.UpdateGSI(totalBatch, schema, oldRecord, newRecord)
+
+			if newRecord != nil {
+				value, _ := model.MarshalRecord(newRecord)
+				totalBatch.Put([]byte(levelDBKey), value)
+			} else {
+				totalBatch.Delete([]byte(levelDBKey))
+			}
+		}
+	}
+
+	if err := s.Database.DB.Write(totalBatch, nil); err != nil {
+		s.writeDynamoDBError(w, "InternalServerError", "Internal DB error during transaction write.", http.StatusInternalServerError)
 		return
 	}
 
