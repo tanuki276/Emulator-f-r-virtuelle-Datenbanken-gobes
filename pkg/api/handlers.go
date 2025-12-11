@@ -461,153 +461,6 @@ func (s *Server) handleTransactWriteItems(w http.ResponseWriter, body []byte) {
 	w.Write([]byte(`{}`))
 }
 
-func (s *Server) writeDynamoDBError(w http.ResponseWriter, errorType string, message string, status int) {
-	w.WriteHeader(status)
-	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
-	fmt.Fprintf(w, `{"__type": "com.amazon.coral.service#%s", "message": "%s"}`, errorType, message)
-}
-
-func (s *Server) parseSetExpression(input *model.UpdateItemInput) (map[string]model.AttributeValue, error) {
-	changes := make(map[string]model.AttributeValue)
-	
-	parts := strings.Split(input.UpdateExpression, "SET")
-	if len(parts) < 2 {
-		return nil, fmt.Errorf("UpdateExpression must contain SET")
-	}
-	setClause := strings.TrimSpace(parts[1])
-
-	updates := strings.Split(setClause, ",")
-	
-	for _, update := range updates {
-		parts := strings.Split(update, "=")
-		if len(parts) != 2 {
-			continue
-		}
-		
-		attrPath := strings.TrimSpace(parts[0])
-		valPlaceholder := strings.TrimSpace(parts[1])
-		
-		var realAttrName string
-		if strings.HasPrefix(attrPath, "#") {
-			if resolvedName, ok := input.ExpressionAttributeNames[attrPath]; ok {
-				realAttrName = resolvedName
-			} else {
-				return nil, fmt.Errorf("attribute name alias %s not defined", attrPath)
-			}
-		} else {
-			realAttrName = attrPath
-		}
-
-		var realValue model.AttributeValue
-		if val, ok := input.ExpressionAttributeValues[valPlaceholder]; ok {
-			realValue = val
-		} else {
-			return nil, fmt.Errorf("attribute value placeholder %s not defined", valPlaceholder)
-		}
-		
-		changes[realAttrName] = realValue
-	}
-	
-	return changes, nil
-}
-
-func (s *Server) handleUpdateItem(w http.ResponseWriter, body []byte) {
-	var input model.UpdateItemInput
-	if err := json.Unmarshal(body, &input); err != nil {
-		s.writeDynamoDBError(w, "ValidationException", "Invalid JSON input for UpdateItem", http.StatusBadRequest)
-		return
-	}
-
-	s.DB.mu.RLock()
-	schema, ok := s.DB.Tables[input.TableName]
-	s.DB.mu.RUnlock()
-	if !ok {
-		s.writeDynamoDBError(w, "ResourceNotFoundException", "Table not found", http.StatusBadRequest)
-		return
-	}
-
-	pkAV, ok := input.Key[schema.PartitionKey]
-	if !ok {
-		s.writeDynamoDBError(w, "ValidationException", fmt.Sprintf("Partition Key '%s' value missing in Key", schema.PartitionKey), http.StatusBadRequest)
-		return
-	}
-	pkVal, _ := model.GetAttributeValueString(pkAV)
-
-	var skVal string
-	if schema.SortKey != "" {
-		if skAV, ok := input.Key[schema.SortKey]; ok {
-			skVal, _ = model.GetAttributeValueString(skAV)
-		}
-	}
-	levelDBKey := model.BuildLevelDBKey(input.TableName, pkVal, skVal)
-
-	s.DB.mu.Lock()
-	defer s.DB.mu.Unlock()
-
-	oldValue, err := s.DB.DB.Get([]byte(levelDBKey), nil)
-	oldRecord := make(model.Record)
-	if err != leveldb.ErrNotFound && err != nil {
-		http.Error(w, "Internal DB error on retrieve", http.StatusInternalServerError)
-		return
-	}
-	if err == nil {
-		oldRecord, _ = model.UnmarshalRecord(oldValue)
-	}
-
-	updates, err := s.parseSetExpression(&input)
-	if err != nil {
-		s.writeDynamoDBError(w, "ValidationException", err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	newRecord := make(model.Record)
-	for k, v := range oldRecord {
-		newRecord[k] = v
-	}
-	for k, v := range updates {
-		newRecord[k] = v
-	}
-    
-    if _, ok := updates[schema.PartitionKey]; ok {
-        s.writeDynamoDBError(w, "ValidationException", "Cannot update Partition Key", http.StatusBadRequest)
-        return
-    }
-    if schema.SortKey != "" {
-        if _, ok := updates[schema.SortKey]; ok {
-             s.writeDynamoDBError(w, "ValidationException", "Cannot update Sort Key", http.StatusBadRequest)
-            return
-        }
-    }
-
-
-	batch := new(leveldb.Batch)
-	s.updateGSI(batch, schema, oldRecord, newRecord)
-
-	value, err := model.MarshalRecord(newRecord)
-	if err != nil {
-		s.writeDynamoDBError(w, "InternalServerError", "Failed to marshal updated item", http.StatusInternalServerError)
-		return
-	}
-	batch.Put([]byte(levelDBKey), value)
-
-	if err := s.DB.DB.Write(batch, nil); err != nil {
-		http.Error(w, "Internal DB error on write", http.StatusInternalServerError)
-		return
-	}
-    
-    responseBody := []byte(`{}`)
-    if input.ReturnValues == "ALL_NEW" {
-        marshaledNewRecord, _ := json.Marshal(newRecord)
-        responseBody = []byte(fmt.Sprintf(`{"Attributes": %s}`, marshaledNewRecord))
-    }
-
-
-	w.WriteHeader(http.StatusOK)
-	w.Write(responseBody)
-}
-
-// --- DeleteItem Handler ---
-
 type DeleteItemInput struct {
 	TableName string `json:"TableName"`
 	Key map[string]model.AttributeValue `json:"Key"`
@@ -679,6 +532,415 @@ func (s *Server) handleDeleteItem(w http.ResponseWriter, body []byte) {
         marshaledOldRecord, _ := json.Marshal(oldRecord)
         responseBody = []byte(fmt.Sprintf(`{"Attributes": %s}`, marshaledOldRecord))
     }
+
+	w.WriteHeader(http.StatusOK)
+	w.Write(responseBody)
+}
+
+func (s *Server) writeDynamoDBError(w http.ResponseWriter, errorType string, message string, status int) {
+	w.WriteHeader(status)
+	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+	fmt.Fprintf(w, `{"__type": "com.amazon.coral.service#%s", "message": "%s"}`, errorType, message)
+}
+
+// --- Update Expression Logic ---
+
+type UpdateActions struct {
+	Set map[string]model.AttributeValue
+	Add map[string]model.AttributeValue
+	Remove []string
+	Delete map[string]model.AttributeValue
+}
+
+func resolveAttributeName(input *model.UpdateItemInput, attrPath string) (string, error) {
+	if strings.HasPrefix(attrPath, "#") {
+		if resolvedName, ok := input.ExpressionAttributeNames[attrPath]; ok {
+			return resolvedName, nil
+		} else {
+			return "", fmt.Errorf("attribute name alias %s not defined", attrPath)
+		}
+	}
+	return attrPath, nil
+}
+
+func resolveAttributeValue(input *model.UpdateItemInput, valPlaceholder string) (model.AttributeValue, error) {
+	if val, ok := input.ExpressionAttributeValues[valPlaceholder]; ok {
+		return val, nil
+	}
+	return nil, fmt.Errorf("attribute value placeholder %s not defined", valPlaceholder)
+}
+
+func (s *Server) parseUpdateExpression(input *model.UpdateItemInput) (*UpdateActions, error) {
+	actions := &UpdateActions{
+		Set: make(map[string]model.AttributeValue),
+		Add: make(map[string]model.AttributeValue),
+		Delete: make(map[string]model.AttributeValue),
+		Remove: []string{},
+	}
+
+	expression := input.UpdateExpression
+	clauses := strings.Split(expression, " ")
+	
+	currentAction := ""
+	
+	for _, clause := range clauses {
+		upperClause := strings.ToUpper(clause)
+		if upperClause == "SET" || upperClause == "ADD" || upperClause == "REMOVE" || upperClause == "DELETE" {
+			currentAction = upperClause
+			continue
+		}
+
+		if currentAction == "" {
+			continue
+		}
+
+		updates := strings.Split(clause, ",")
+		for _, update := range updates {
+			update = strings.TrimSpace(update)
+			if update == "" {
+				continue
+			}
+
+			if currentAction == "SET" || currentAction == "ADD" || currentAction == "DELETE" {
+				parts := strings.Split(update, "=")
+				if len(parts) != 2 {
+					return nil, fmt.Errorf("invalid %s clause syntax: %s", currentAction, update)
+				}
+				
+				attrPath := strings.TrimSpace(parts[0])
+				valPlaceholder := strings.TrimSpace(parts[1])
+				
+				realAttrName, err := resolveAttributeName(input, attrPath)
+				if err != nil { return nil, err }
+
+				realValue, err := resolveAttributeValue(input, valPlaceholder)
+				if err != nil { return nil, err }
+
+				switch currentAction {
+				case "SET":
+					actions.Set[realAttrName] = realValue
+				case "ADD":
+					actions.Add[realAttrName] = realValue
+				case "DELETE":
+					actions.Delete[realAttrName] = realValue
+				}
+			} else if currentAction == "REMOVE" {
+				attrPath := strings.TrimSpace(update)
+				realAttrName, err := resolveAttributeName(input, attrPath)
+				if err != nil { return nil, err }
+				actions.Remove = append(actions.Remove, realAttrName)
+			}
+		}
+	}
+	
+	return actions, nil
+}
+
+func applyAdd(oldRecord model.Record, attrName string, addValue model.AttributeValue) error {
+	for k, v := range addValue {
+		switch k {
+		case "N":
+			if len(oldRecord[attrName]) == 0 {
+				oldRecord[attrName] = addValue
+				return nil
+			}
+			
+			oldNumStr, ok := oldRecord[attrName]["N"].(string)
+			if !ok {
+				return fmt.Errorf("ADD failed: attribute %s is not a Number", attrName)
+			}
+			newNumStr, ok := addValue["N"].(string)
+			if !ok {
+				return fmt.Errorf("ADD failed: input value is not a Number", attrName)
+			}
+
+			var oldNum, newNum float64
+			fmt.Sscanf(oldNumStr, "%f", &oldNum)
+			fmt.Sscanf(newNumStr, "%f", &newNum)
+
+			sum := oldNum + newNum
+			oldRecord[attrName] = model.AttributeValue{"N": fmt.Sprintf("%f", sum)}
+			
+		case "NS":
+			oldSet := map[string]struct{}{}
+			if oldAV, ok := oldRecord[attrName]; ok {
+				if oldNS, ok := model.GetNumberSet(oldAV); ok {
+					for _, item := range oldNS { oldSet[item] = struct{}{} }
+				}
+			}
+			
+			newNS, ok := model.GetNumberSet(addValue)
+			if !ok {
+				return fmt.Errorf("ADD failed: input value is not a Number Set")
+			}
+			
+			for _, item := range newNS { oldSet[item] = struct{}{} }
+			
+			resultList := make([]string, 0, len(oldSet))
+			for item := range oldSet { resultList = append(resultList, item) }
+			
+			interfaceList := make([]interface{}, len(resultList))
+			for i, v := range resultList { interfaceList[i] = v }
+			
+			oldRecord[attrName] = model.AttributeValue{"NS": interfaceList}
+
+		case "SS":
+			oldSet := map[string]struct{}{}
+			if oldAV, ok := oldRecord[attrName]; ok {
+				if oldSS, ok := model.GetStringSet(oldAV); ok {
+					for _, item := range oldSS { oldSet[item] = struct{}{} }
+				}
+			}
+
+			newSS, ok := model.GetStringSet(addValue)
+			if !ok {
+				return fmt.Errorf("ADD failed: input value is not a String Set")
+			}
+
+			for _, item := range newSS { oldSet[item] = struct{}{} }
+
+			resultList := make([]string, 0, len(oldSet))
+			for item := range oldSet { resultList = append(resultList, item) }
+
+			interfaceList := make([]interface{}, len(resultList))
+			for i, v := range resultList { interfaceList[i] = v }
+			
+			oldRecord[attrName] = model.AttributeValue{"SS": interfaceList}
+		
+		case "BS":
+			oldSet := map[string]struct{}{}
+			if oldAV, ok := oldRecord[attrName]; ok {
+				if oldBS, ok := model.GetBinarySet(oldAV); ok {
+					for _, item := range oldBS { oldSet[item] = struct{}{} }
+				}
+			}
+
+			newBS, ok := model.GetBinarySet(addValue)
+			if !ok {
+				return fmt.Errorf("ADD failed: input value is not a Binary Set")
+			}
+
+			for _, item := range newBS { oldSet[item] = struct{}{} }
+
+			resultList := make([]string, 0, len(oldSet))
+			for item := range oldSet { resultList = append(resultList, item) }
+
+			interfaceList := make([]interface{}, len(resultList))
+			for i, v := range resultList { interfaceList[i] = v }
+			
+			oldRecord[attrName] = model.AttributeValue{"BS": interfaceList}
+		}
+	}
+	
+	return nil
+}
+
+func applyDelete(oldRecord model.Record, attrName string, deleteValue model.AttributeValue) error {
+	if len(oldRecord[attrName]) == 0 {
+		return nil
+	}
+	
+	for k, _ := range deleteValue {
+		switch k {
+		case "NS":
+			oldSet := map[string]struct{}{}
+			oldAV, ok := oldRecord[attrName]
+			if ok {
+				if oldNS, ok := model.GetNumberSet(oldAV); ok {
+					for _, item := range oldNS { oldSet[item] = struct{}{} }
+				}
+			}
+
+			newNS, ok := model.GetNumberSet(deleteValue)
+			if !ok {
+				return fmt.Errorf("DELETE failed: input value is not a Number Set")
+			}
+			
+			for _, item := range newNS { delete(oldSet, item) }
+			
+			resultList := make([]string, 0, len(oldSet))
+			for item := range oldSet { resultList = append(resultList, item) }
+
+			if len(resultList) == 0 {
+				delete(oldRecord, attrName)
+			} else {
+				interfaceList := make([]interface{}, len(resultList))
+				for i, v := range resultList { interfaceList[i] = v }
+				oldRecord[attrName] = model.AttributeValue{"NS": interfaceList}
+			}
+			
+		case "SS":
+			oldSet := map[string]struct{}{}
+			oldAV, ok := oldRecord[attrName]
+			if ok {
+				if oldSS, ok := model.GetStringSet(oldAV); ok {
+					for _, item := range oldSS { oldSet[item] = struct{}{} }
+				}
+			}
+
+			newSS, ok := model.GetStringSet(deleteValue)
+			if !ok {
+				return fmt.Errorf("DELETE failed: input value is not a String Set")
+			}
+
+			for _, item := range newSS { delete(oldSet, item) }
+
+			resultList := make([]string, 0, len(oldSet))
+			for item := range oldSet { resultList = append(resultList, item) }
+
+			if len(resultList) == 0 {
+				delete(oldRecord, attrName)
+			} else {
+				interfaceList := make([]interface{}, len(resultList))
+				for i, v := range resultList { interfaceList[i] = v }
+				oldRecord[attrName] = model.AttributeValue{"SS": interfaceList}
+			}
+			
+		case "BS":
+			oldSet := map[string]struct{}{}
+			oldAV, ok := oldRecord[attrName]
+			if ok {
+				if oldBS, ok := model.GetBinarySet(oldAV); ok {
+					for _, item := range oldBS { oldSet[item] = struct{}{} }
+				}
+			}
+
+			newBS, ok := model.GetBinarySet(deleteValue)
+			if !ok {
+				return fmt.Errorf("DELETE failed: input value is not a Binary Set")
+			}
+
+			for _, item := range newBS { delete(oldSet, item) }
+
+			resultList := make([]string, 0, len(oldSet))
+			for item := range oldSet { resultList = append(resultList, item) }
+
+			if len(resultList) == 0 {
+				delete(oldRecord, attrName)
+			} else {
+				interfaceList := make([]interface{}, len(resultList))
+				for i, v := range resultList { interfaceList[i] = v }
+				oldRecord[attrName] = model.AttributeValue{"BS": interfaceList}
+			}
+		default:
+			return fmt.Errorf("DELETE failed: unsupported attribute type for DELETE")
+		}
+	}
+	return nil
+}
+
+func applyRemove(newRecord model.Record, attrName string) {
+	delete(newRecord, attrName)
+}
+
+func (s *Server) handleUpdateItem(w http.ResponseWriter, body []byte) {
+	var input model.UpdateItemInput
+	if err := json.Unmarshal(body, &input); err != nil {
+		s.writeDynamoDBError(w, "ValidationException", "Invalid JSON input for UpdateItem", http.StatusBadRequest)
+		return
+	}
+
+	s.DB.mu.RLock()
+	schema, ok := s.DB.Tables[input.TableName]
+	s.DB.mu.RUnlock()
+	if !ok {
+		s.writeDynamoDBError(w, "ResourceNotFoundException", "Table not found", http.StatusBadRequest)
+		return
+	}
+
+	pkAV, ok := input.Key[schema.PartitionKey]
+	if !ok {
+		s.writeDynamoDBError(w, "ValidationException", fmt.Sprintf("Partition Key '%s' value missing in Key", schema.PartitionKey), http.StatusBadRequest)
+		return
+	}
+	pkVal, _ := model.GetAttributeValueString(pkAV)
+
+	var skVal string
+	if schema.SortKey != "" {
+		if skAV, ok := input.Key[schema.SortKey]; ok {
+			skVal, _ = model.GetAttributeValueString(skAV)
+		}
+	}
+	levelDBKey := model.BuildLevelDBKey(input.TableName, pkVal, skVal)
+
+	s.DB.mu.Lock()
+	defer s.DB.mu.Unlock()
+
+	oldValue, err := s.DB.DB.Get([]byte(levelDBKey), nil)
+	oldRecord := make(model.Record)
+	if err != leveldb.ErrNotFound && err != nil {
+		http.Error(w, "Internal DB error on retrieve", http.StatusInternalServerError)
+		return
+	}
+	if err == nil {
+		oldRecord, _ = model.UnmarshalRecord(oldValue)
+	}
+
+	actions, err := s.parseUpdateExpression(&input)
+	if err != nil {
+		s.writeDynamoDBError(w, "ValidationException", err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	newRecord := make(model.Record)
+	for k, v := range oldRecord {
+		newRecord[k] = v
+	}
+	
+	for _, attrName := range actions.Remove {
+		applyRemove(newRecord, attrName)
+	}
+
+	for attrName, deleteValue := range actions.Delete {
+		if err := applyDelete(newRecord, attrName, deleteValue); err != nil {
+			s.writeDynamoDBError(w, "ValidationException", err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	for attrName, addValue := range actions.Add {
+		if err := applyAdd(newRecord, attrName, addValue); err != nil {
+			s.writeDynamoDBError(w, "ValidationException", err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	
+	for attrName, setValue := range actions.Set {
+		newRecord[attrName] = setValue
+	}
+
+    if _, ok := actions.Set[schema.PartitionKey]; ok || len(actions.Add[schema.PartitionKey]) > 0 {
+        s.writeDynamoDBError(w, "ValidationException", "Cannot update Partition Key", http.StatusBadRequest)
+        return
+    }
+    if schema.SortKey != "" {
+        if _, ok := actions.Set[schema.SortKey]; ok || len(actions.Add[schema.SortKey]) > 0 {
+             s.writeDynamoDBError(w, "ValidationException", "Cannot update Sort Key", http.StatusBadRequest)
+            return
+        }
+    }
+
+	batch := new(leveldb.Batch)
+	s.updateGSI(batch, oldRecord, newRecord)
+
+	value, err := model.MarshalRecord(newRecord)
+	if err != nil {
+		s.writeDynamoDBError(w, "InternalServerError", "Failed to marshal updated item", http.StatusInternalServerError)
+		return
+	}
+	batch.Put([]byte(levelDBKey), value)
+
+	if err := s.DB.DB.Write(batch, nil); err != nil {
+		http.Error(w, "Internal DB error on write", http.StatusInternalServerError)
+		return
+	}
+    
+    responseBody := []byte(`{}`)
+    if input.ReturnValues == "ALL_NEW" {
+        marshaledNewRecord, _ := json.Marshal(newRecord)
+        responseBody = []byte(fmt.Sprintf(`{"Attributes": %s}`, marshaledNewRecord))
+    }
+
 
 	w.WriteHeader(http.StatusOK)
 	w.Write(responseBody)
