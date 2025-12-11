@@ -8,8 +8,8 @@ import (
 
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/util"
-	"your_project/pkg/core"
-	"your_project/pkg/model"
+	"Emulator-fr-virtuelle-Datenbanken-gobes/pkg/core"
+	"Emulator-fr-virtuelle-Datenbanken-gobes/pkg/model"
 )
 
 type CreateTableInput struct {
