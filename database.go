@@ -61,8 +61,8 @@ func (d *Database) Close() error {
 }
 
 func (d *Database) CreateSnapshot(name string) error {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
 	if name == "" {
 		return fmt.Errorf("snapshot name cannot be empty")
