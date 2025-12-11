@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -56,7 +55,6 @@ func NewDatabase() (*Database, error) {
 }
 
 func (d *Database) Close() error {
-	log.Println("Shutting down LevelDB...")
 	return d.DB.Close()
 }
 
@@ -77,8 +75,6 @@ func (d *Database) CreateSnapshot(name string) error {
 	if _, err := os.Stat(dest); !os.IsNotExist(err) {
 		return fmt.Errorf("snapshot '%s' already exists", name)
 	}
-
-	log.Printf("Creating snapshot '%s'...", name)
 	
 	files, err := os.ReadDir(StoragePath)
 	if err != nil {
@@ -93,14 +89,12 @@ func (d *Database) CreateSnapshot(name string) error {
 
 		data, err := os.ReadFile(srcPath)
 		if err != nil {
-			log.Printf("Warning: Failed to read file %s: %v", srcPath, err)
 			continue
 		}
 		if err := os.WriteFile(dstPath, data, 0644); err != nil {
 			return fmt.Errorf("failed to write file to snapshot: %w", err)
 		}
 	}
-	log.Printf("Snapshot '%s' created successfully at %s", name, dest)
 	return nil
 }
 
@@ -133,7 +127,6 @@ func (d *Database) LoadSnapshot(name string) error {
 		
 		data, err := os.ReadFile(srcPath)
 		if err != nil {
-			log.Printf("Warning: Failed to read file %s: %v", srcPath, err)
 			continue
 		}
 		if err := os.WriteFile(dstPath, data, 0644); err != nil {
@@ -146,6 +139,5 @@ func (d *Database) LoadSnapshot(name string) error {
 		return fmt.Errorf("failed to reopen LevelDB after loading snapshot: %w", err)
 	}
 	d.DB = newDB
-	log.Printf("Snapshot '%s' loaded successfully.", name)
 	return nil
 }
