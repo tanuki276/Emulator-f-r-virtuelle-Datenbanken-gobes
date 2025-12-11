@@ -20,6 +20,9 @@ type TableSchema struct {
 type PutItemInput struct {
 	TableName string `json:"TableName"`
 	Item Record `json:"Item"`
+    ConditionExpression string `json:"ConditionExpression,omitempty"`
+    ExpressionAttributeNames map[string]string `json:"ExpressionAttributeNames,omitempty"`
+    ExpressionAttributeValues map[string]AttributeValue `json:"ExpressionAttributeValues,omitempty"`
 }
 
 type QueryInput struct {
@@ -40,4 +43,10 @@ type UpdateItemInput struct {
 	ExpressionAttributeNames map[string]string `json:"ExpressionAttributeNames,omitempty"`
 	ExpressionAttributeValues map[string]AttributeValue `json:"ExpressionAttributeValues,omitempty"`
 	ReturnValues string `json:"ReturnValues,omitempty"`
+}
+
+type ConditionInput struct {
+    ConditionExpression string
+    ExpressionAttributeNames map[string]string
+    ExpressionAttributeValues map[string]AttributeValue
 }
