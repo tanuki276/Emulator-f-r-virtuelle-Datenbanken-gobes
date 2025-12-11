@@ -3,11 +3,11 @@ package model
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 )
 
 const KeySeparator = "#"
 const GSIKeySeparator = "$"
+const SnapshotDir = "dynamodb_snapshots"
 
 func BuildLevelDBKey(tableName string, pkVal string, skVal string) string {
 	if skVal == "" {
