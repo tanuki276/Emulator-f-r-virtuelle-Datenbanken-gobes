@@ -13,10 +13,6 @@ import (
 	"Emulator-fr-virtuelle-Datenbanken-gobes/pkg/model"
 )
 
-// --------------------------------------------------
-// PUT ITEM
-// --------------------------------------------------
-
 func (s *Server) handlePutItem(w http.ResponseWriter, body []byte) {
 	var input model.PutItemInput
     if err := json.Unmarshal(body, &input); err != nil {
@@ -100,10 +96,6 @@ func (s *Server) handlePutItem(w http.ResponseWriter, body []byte) {
 	w.Write([]byte(`{}`))
 }
 
-// --------------------------------------------------
-// GET ITEM
-// --------------------------------------------------
-
 type GetItemInput struct {
 	TableName string `json:"TableName"`
 	Key map[string]model.AttributeValue `json:"Key"`
@@ -157,10 +149,6 @@ func (s *Server) handleGetItem(w http.ResponseWriter, body []byte) {
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, `{"Item": %s}`, string(value))
 }
-
-// --------------------------------------------------
-// QUERY
-// --------------------------------------------------
 
 type QueryOutput struct {
 	Items []model.Record `json:"Items"`
@@ -285,10 +273,6 @@ func (s *Server) handleQuery(w http.ResponseWriter, body []byte) {
 	w.Write(responseBody)
 }
 
-// --------------------------------------------------
-// DELETE ITEM
-// --------------------------------------------------
-
 type DeleteItemInput struct {
 	TableName string `json:"TableName"`
 	Key map[string]model.AttributeValue `json:"Key"`
@@ -388,10 +372,6 @@ func (s *Server) handleDeleteItem(w http.ResponseWriter, body []byte) {
 	w.WriteHeader(http.StatusOK)
 	w.Write(responseBody)
 }
-
-// --------------------------------------------------
-// UPDATE ITEM
-// --------------------------------------------------
 
 func (s *Server) handleUpdateItem(w http.ResponseWriter, body []byte) {
 	var input model.UpdateItemInput
@@ -506,10 +486,6 @@ func (s *Server) handleUpdateItem(w http.ResponseWriter, body []byte) {
 	w.WriteHeader(http.StatusOK)
 	w.Write(responseBody)
 }
-
-// --------------------------------------------------
-// TRANSACT WRITE ITEMS
-// --------------------------------------------------
 
 type TransactWriteItem struct {
 	ConditionCheck *struct {
