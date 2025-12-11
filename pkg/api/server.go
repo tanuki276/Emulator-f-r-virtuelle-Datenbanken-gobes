@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
-	"your_project/pkg/core"
+	"Emulator-fr-virtuelle-Datenbanken-gobes/pkg/core"
 )
 
 type Server struct {
