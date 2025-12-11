@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 
@@ -12,14 +11,53 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
-type KeySchemaElement struct {
-	AttributeName string `json:"AttributeName"`
-	KeyType string `json:"KeyType"`
+const GSIKeySeparator = "$"
+
+func buildGSILevelDBKey(indexName string, gpkVal string, gskVal string, basePkVal string) string {
+	if gskVal == "" {
+		return fmt.Sprintf("%s%s%s%s%s", indexName, GSIKeySeparator, gpkVal, GSIKeySeparator, basePkVal)
+	}
+	return fmt.Sprintf("%s%s%s%s%s%s%s", indexName, GSIKeySeparator, gpkVal, GSIKeySeparator, gskVal, GSIKeySeparator, basePkVal)
 }
 
-type CreateTableInput struct {
-	TableName string `json:"TableName"`
-	KeySchema []KeySchemaElement `json:"KeySchema"`
+func (s *Server) updateGSI(batch *leveldb.Batch, schema TableSchema, oldRecord Record, newRecord Record) {
+	if len(schema.GSIs) == 0 {
+		return
+	}
+
+	mainPKAV, _ := getAttributeValueString(newRecord[schema.PartitionKey])
+	
+	for _, gsi := range schema.GSIs {
+		oldGpkVal := ""
+		oldGskVal := ""
+		newGpkVal := ""
+		newGskVal := ""
+		
+		
+		gpkAVOld, okOld := oldRecord[gsi.PartitionKey]
+		if okOld { oldGpkVal, _ = getAttributeValueString(gpkAVOld) }
+		
+		gpkAVNew, okNew := newRecord[gsi.PartitionKey]
+		if okNew { newGpkVal, _ = getAttributeValueString(gpkAVNew) }
+
+		if gsi.SortKey != "" {
+			gskAVOld, okOld := oldRecord[gsi.SortKey]
+			if okOld { gskValOld, _ := getAttributeValueString(gskAVOld); oldGskVal = gskValOld }
+
+			gskAVNew, okNew := newRecord[gsi.SortKey]
+			if okNew { gskValNew, _ := getAttributeValueString(gskAVNew); newGskVal = gskValNew }
+		}
+
+		if oldGpkVal != "" && (oldGpkVal != newGpkVal || oldGskVal != newGskVal) {
+			oldGSIKey := buildGSILevelDBKey(gsi.IndexName, oldGpkVal, oldGskVal, mainPKAV)
+			batch.Delete([]byte(oldGSIKey))
+		}
+
+		if newGpkVal != "" {
+			newGSIKey := buildGSILevelDBKey(gsi.IndexName, newGpkVal, newGskVal, mainPKAV)
+			batch.Put([]byte(newGSIKey), []byte{})
+		}
+	}
 }
 
 func (s *Server) handleCreateTable(w http.ResponseWriter, body []byte) {
@@ -57,11 +95,6 @@ func (s *Server) handleCreateTable(w http.ResponseWriter, body []byte) {
 	w.Write([]byte(fmt.Sprintf(`{"TableDescription": {"TableName": "%s", "TableStatus": "ACTIVE"}}`, input.TableName)))
 }
 
-type PutItemInput struct {
-	TableName string `json:"TableName"`
-	Item Record `json:"Item"`
-}
-
 func (s *Server) handlePutItem(w http.ResponseWriter, body []byte) {
 	var input PutItemInput
 	if err := json.Unmarshal(body, &input); err != nil {
@@ -93,17 +126,32 @@ func (s *Server) handlePutItem(w http.ResponseWriter, body []byte) {
 	}
 
 	levelDBKey := buildLevelDBKey(input.TableName, pkVal, skVal)
-	value, err := marshalRecord(input.Item)
-	if err != nil {
-		log.Printf("Failed to marshal item: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
+	
+	batch := new(leveldb.Batch)
+	
 	s.DB.mu.Lock()
 	defer s.DB.mu.Unlock()
-	if err := s.DB.DB.Put([]byte(levelDBKey), value, nil); err != nil {
-		log.Printf("LevelDB Put error: %v", err)
+
+	oldValue, err := s.DB.DB.Get([]byte(levelDBKey), nil)
+	var oldRecord Record
+	if err != leveldb.ErrNotFound && err != nil {
+		http.Error(w, "Internal DB error", http.StatusInternalServerError)
+		return
+	}
+	if err == nil {
+		oldRecord, _ = unmarshalRecord(oldValue)
+	}
+
+	s.updateGSI(batch, schema, oldRecord, input.Item)
+
+	value, err := marshalRecord(input.Item)
+	if err != nil {
+		s.writeDynamoDBError(w, "InternalServerError", "Failed to marshal item", http.StatusInternalServerError)
+		return
+	}
+	batch.Put([]byte(levelDBKey), value)
+
+	if err := s.DB.DB.Write(batch, nil); err != nil {
 		http.Error(w, "Internal DB error", http.StatusInternalServerError)
 		return
 	}
@@ -158,7 +206,6 @@ func (s *Server) handleGetItem(w http.ResponseWriter, body []byte) {
 		return
 	}
 	if err != nil {
-		log.Printf("LevelDB Get error: %v", err)
 		http.Error(w, "Internal DB error", http.StatusInternalServerError)
 		return
 	}
@@ -169,6 +216,7 @@ func (s *Server) handleGetItem(w http.ResponseWriter, body []byte) {
 
 type QueryInput struct {
 	TableName string `json:"TableName"`
+	IndexName string `json:"IndexName,omitempty"`
 	KeyConditionExpression string `json:"KeyConditionExpression"`
 	ExpressionAttributeValues map[string]AttributeValue `json:"ExpressionAttributeValues"`
 	Limit int64 `json:"Limit"`
@@ -205,15 +253,34 @@ func (s *Server) handleQuery(w http.ResponseWriter, body []byte) {
 	}
 	pkVal, _ := getAttributeValueString(pkValuePlaceholder)
 
-	prefix := buildLevelDBKey(input.TableName, pkVal, "")
-	
+	var iteratorPrefix []byte
+	var isGSIQuery bool = false
+
+	if input.IndexName == "" {
+		prefix := buildLevelDBKey(input.TableName, pkVal, "")
+		iteratorPrefix = []byte(prefix)
+	} else {
+		s.DB.mu.RLock()
+		gsiSchema, exists := schema.GSIs[input.IndexName]
+		s.DB.mu.RUnlock()
+		if !exists {
+			s.writeDynamoDBError(w, "ValidationException", fmt.Sprintf("Index %s not found", input.IndexName), http.StatusBadRequest)
+			return
+		}
+
+		prefix := buildGSILevelDBKey(gsiSchema.IndexName, pkVal, "", "")
+		iteratorPrefix = []byte(prefix)
+		isGSIQuery = true
+	}
+
+
 	s.DB.mu.RLock()
 	defer s.DB.mu.RUnlock()
-	iter := s.DB.DB.NewIterator(util.BytesPrefix([]byte(prefix)), nil)
+	iter := s.DB.DB.NewIterator(util.BytesPrefix(iteratorPrefix), nil)
 	defer iter.Release()
     
     if !input.ScanIndexForward {
-        log.Println("WARNING: ScanIndexForward=false is not fully supported, using forward scan.")
+        
     }
     
     if len(input.ExclusiveStartKey) > 0 {
@@ -238,11 +305,32 @@ func (s *Server) handleQuery(w http.ResponseWriter, body []byte) {
 	if limit <= 0 { limit = 1000 } 
 
 	for i := 0; i < int(limit) && iter.Valid(); iter.Next() {
-		value := iter.Value()
 		
-		record, err := unmarshalRecord(value)
+		var value []byte
+		var err error
+		var record Record
+
+		if isGSIQuery {
+			key := iter.Key()
+			keyParts := strings.Split(string(key), GSIKeySeparator)
+			if len(keyParts) < 4 { continue }
+			
+			basePKVal := keyParts[len(keyParts)-1]
+			
+			mainKey := buildLevelDBKey(input.TableName, basePKVal, "") 
+			value, err = s.DB.DB.Get([]byte(mainKey), nil)
+		} else {
+			value = iter.Value()
+		}
+
+		if err != nil && err != leveldb.ErrNotFound {
+			continue
+		}
+		
+		if err == leveldb.ErrNotFound { continue }
+
+		record, err = unmarshalRecord(value)
 		if err != nil {
-			log.Printf("Failed to unmarshal record from LevelDB: %v", err)
 			continue
 		}
 		
@@ -304,7 +392,7 @@ func (s *Server) handleTransactWriteItems(w http.ResponseWriter, body []byte) {
 
 	for _, item := range input.TransactItems {
 		if item.ConditionCheck != nil {
-			log.Println("ConditionCheck received, skipping complex evaluation.")
+			
 		}
 	}
 	
@@ -350,15 +438,37 @@ func (s *Server) handleTransactWriteItems(w http.ResponseWriter, body []byte) {
 		levelDBKey := buildLevelDBKey(tableName, pkVal, skVal)
 
 		if opType == "PUT" {
+			oldValue, err := s.DB.DB.Get([]byte(levelDBKey), nil)
+			var oldRecord Record
+			if err != leveldb.ErrNotFound && err != nil {
+				http.Error(w, "Internal DB error", http.StatusInternalServerError)
+				return
+			}
+			if err == nil {
+				oldRecord, _ = unmarshalRecord(oldValue)
+			}
+
+			s.updateGSI(batch, schema, oldRecord, itemData)
+			
 			value, _ := marshalRecord(itemData)
 			batch.Put([]byte(levelDBKey), value)
 		} else if opType == "DELETE" {
+			oldValue, err := s.DB.DB.Get([]byte(levelDBKey), nil)
+			var oldRecord Record
+			if err != leveldb.ErrNotFound && err != nil {
+				http.Error(w, "Internal DB error", http.StatusInternalServerError)
+				return
+			}
+			if err == nil {
+				oldRecord, _ = unmarshalRecord(oldValue)
+			}
+			s.updateGSI(batch, schema, oldRecord, nil) 
+
 			batch.Delete([]byte(levelDBKey))
 		}
 	}
 
 	if err := s.DB.DB.Write(batch, nil); err != nil {
-		log.Printf("LevelDB batch write failed: %v", err)
 		http.Error(w, "Internal DB error during transaction", http.StatusInternalServerError)
 		return
 	}
