@@ -31,3 +31,13 @@ type QueryInput struct {
 	ScanIndexForward bool `json:"ScanIndexForward"`
 	ExclusiveStartKey Record `json:"ExclusiveStartKey"`
 }
+
+type UpdateItemInput struct {
+	TableName string `json:"TableName"`
+	Key Record `json:"Key"`
+	UpdateExpression string `json:"UpdateExpression"`
+	ConditionExpression string `json:"ConditionExpression,omitempty"`
+	ExpressionAttributeNames map[string]string `json:"ExpressionAttributeNames,omitempty"`
+	ExpressionAttributeValues map[string]AttributeValue `json:"ExpressionAttributeValues,omitempty"`
+	ReturnValues string `json:"ReturnValues,omitempty"`
+}
