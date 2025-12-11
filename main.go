@@ -1,7 +1,6 @@
 package main
 
 import (
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
@@ -19,7 +18,7 @@ func main() {
 			
 			db, err := NewDatabase()
 			if err != nil {
-				log.Fatalf("DB initialization failed: %v", err)
+				os.Exit(1)
 			}
 
 			subcommand := os.Args[2]
@@ -27,11 +26,11 @@ func main() {
 
 			if subcommand == "create" {
 				if err := db.CreateSnapshot(name); err != nil {
-					log.Fatalf("Snapshot creation failed: %v", err)
+					os.Exit(1)
 				}
 			} else if subcommand == "load" {
 				if err := db.LoadSnapshot(name); err != nil {
-					log.Fatalf("Snapshot loading failed: %v", err)
+					os.Exit(1)
 				}
 			} else {
 				fmt.Println("Invalid snapshot subcommand. Use 'create' or 'load'.")
@@ -43,7 +42,7 @@ func main() {
 
 	db, err := NewDatabase()
 	if err != nil {
-		log.Fatalf("Database initialization failed: %v", err)
+		os.Exit(1)
 	}
 	defer db.Close()
 
@@ -53,6 +52,4 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-
-	log.Println("Server shutting down...")
 }
